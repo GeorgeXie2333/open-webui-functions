@@ -1,75 +1,73 @@
 """
-title: OpenAI Reasoning Pipe with Summary via Responses API
-author: GeorgeTse
-author_url: https://github.com/GeorgeXie2333
-version: 1.0
+title: OpenAI Responses Pipe with Reasoning Summary
+author_url:https://github.com/GeorgeXie2333
+author: George
+version: 0.1.1
+license: MIT
 """
 
-from __future__ import annotations
-
-import json
-import re
-from typing import (
-    Dict,
-    AsyncGenerator,
-    List,
-    Union,
-)
-
-import httpx
 from pydantic import BaseModel, Field
+import httpx
+import json
+import random
+import re
+from typing import Dict, AsyncGenerator, List, Union, Literal
 
 
 class Pipe:
-
-    # ------------------------------------------------------------------
-    #                       User settings (Valves)
-    # ------------------------------------------------------------------
-
     class Valves(BaseModel):
-        OPENAI_API_BASE_URL: str = Field(
-            default="https://api.openai.com/v1",
-            description="Base URL of the OpenAI API (no trailing slash).",
-        )
-        OPENAI_API_KEY: str = Field(
-            default="",
-            description="Your OpenAI API key (sk‑…). Required for outbound calls.",
-        )
-        SUMMARY_MODE: str = Field(
-            default="auto",
-            description="Reasoning summary style: auto | concise | detailed",
-        )
-        TARGET_MODELS: str = Field(
-            default="o3,o4-mini",
-            description="Comma‑separated base model IDs that should get reasoning injection.",
-        )
         NAME_PREFIX: str = Field(
-            default="REASONING/",
-            description="Prefix shown before each exposed model name.",
+            default="OpenAI: ",
+            description="Prefix to be added before model names.",
+        )
+        BASE_URL: str = Field(
+            default="https://api.openai.com/v1",
+            description="Base URL for OpenAI API.",
+        )
+        API_KEYS: str = Field(
+            default="",
+            description="API keys for OpenAI, use , to split",
+        )
+        NORMAL_MODELS: str = Field(
+            default="gpt-4.5-preview,chatgpt-4o-latest",
+            description="Comma-separated normal model IDs (no reasoning).",
+        )
+        REASONING_MODELS: str = Field(
+            default="o4-mini,o3,o3-mini,o1",
+            description="Comma-separated reasoning model IDs (with thinking process).",
+        )
+        SUMMARY_MODE: Literal["auto", "concise", "detailed", "None"] = Field(
+            default="auto",
+            description="Reasoning summary mode for reasoning models: auto | concise | detailed | None",
         )
 
     def __init__(self):
         self.valves = self.Valves()
 
-    # ------------------------------------------------------------------
-    #                  Expose selectable models to WebUI
-    # ------------------------------------------------------------------
-
     def pipes(self):
-        suffixes = ["", "-high"]
-        bases = [m.strip() for m in self.valves.TARGET_MODELS.split(",") if m.strip()]
-        return [
-            {
-                "id": f"responses-{b}{s}".lower().replace("/", "-"),
-                "name": f"{self.valves.NAME_PREFIX}{b}{s}",
-            }
-            for b in bases
-            for s in suffixes
-        ]
+        res = []
 
-    # ------------------------------------------------------------------
-    #                           Helper utils
-    # ------------------------------------------------------------------
+        # Add normal models
+        normal_models = [
+            m.strip() for m in self.valves.NORMAL_MODELS.split(",") if m.strip()
+        ]
+        for model in normal_models:
+            res.append({"name": f"{self.valves.NAME_PREFIX}{model}", "id": model})
+
+        # Add reasoning models (both normal and -high variants)
+        reasoning_models = [
+            m.strip() for m in self.valves.REASONING_MODELS.split(",") if m.strip()
+        ]
+        for model in reasoning_models:
+            res.append({"name": f"{self.valves.NAME_PREFIX}{model}", "id": model})
+            res.append(
+                {
+                    "name": f"{self.valves.NAME_PREFIX}{model}-high",
+                    "id": f"{model}-high",
+                }
+            )
+
+        return res
 
     @classmethod
     def _pick_text(cls, payload: Union[str, Dict]) -> str:
@@ -97,14 +95,28 @@ class Pipe:
     def _envelope(text: str) -> bytes:
         return json.dumps({"choices": [{"delta": {"content": text}}]}).encode()
 
-    # ------------------------------------------------------------------
-    #                           Main logic
-    # ------------------------------------------------------------------
+    def _is_reasoning_model(self, model_id: str) -> bool:
+        """Check if the model is a reasoning model"""
+        base_model = model_id.replace("-high", "")
+        reasoning_models = [
+            m.strip().lower()
+            for m in self.valves.REASONING_MODELS.split(",")
+            if m.strip()
+        ]
+        return base_model.lower() in reasoning_models
 
-    async def pipe(
-        self, body: dict
-    ) -> AsyncGenerator[bytes, None]:  # Changed to async def and AsyncGenerator
-        # ---- convert Chat → Responses schema -----------------------
+    def _is_normal_model(self, model_id: str) -> bool:
+        """Check if the model is a normal model"""
+        normal_models = [
+            m.strip().lower() for m in self.valves.NORMAL_MODELS.split(",") if m.strip()
+        ]
+        return model_id.lower() in normal_models
+
+    async def _handle_reasoning_model(
+        self, body: dict, model_id: str, headers: dict
+    ) -> AsyncGenerator[str, None]:
+        """Handle reasoning models with summary output"""
+        # Convert messages to input format for Responses API
         if "input" not in body and "messages" in body:
             input_blocks: List[Dict] = []
             for msg in body.pop("messages"):
@@ -118,14 +130,18 @@ class Pipe:
 
                 parts: List[Dict] = []
                 for part in raw_content:
-                    # image_url => input_image
+                    # Handle image_url => input_image
                     if isinstance(part, dict) and part.get("type") == "image_url":
                         url = (part.get("image_url") or {}).get("url")
                         if url:
                             parts.append({"type": "input_image", "image_url": url})
                         continue
-                    # fallback to text
-                    txt = part if isinstance(part, str) else str(part)
+                    # Handle text content
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        txt = part.get("text", "")
+                    else:
+                        txt = part if isinstance(part, str) else str(part)
+
                     if txt:
                         parts.append({"type": "input_text", "text": txt})
 
@@ -144,108 +160,182 @@ class Pipe:
                 )
             body["input"] = input_blocks
 
-        # ---- model sanitise ---------------------------------------
-        raw = str(body.get("model", ""))
-        name = raw.rsplit(".", 1)[-1]
-        for pre in ("openai_responses_pipe.", "responses-"):
-            if name.startswith(pre):
-                name = name[len(pre) :]
-        m = re.search(r"-(low|medium|high)$", name, re.I)
-        effort = m.group(1).lower() if m else None
-        base = name[: -len(m.group(0))] if m else name
+        # Handle model name and effort
+        base_model = model_id.replace("-high", "")
+        effort = "high" if model_id.endswith("-high") else "medium"
 
-        if base.lower() in {
-            m.strip().lower() for m in self.valves.TARGET_MODELS.split(",") if m.strip()
-        }:
-            reasoning = body.setdefault("reasoning", {})
-            reasoning.setdefault("summary", self.valves.SUMMARY_MODE)
-            if effort and "effort" not in reasoning:
-                reasoning["effort"] = effort
+        # Set reasoning parameters
+        reasoning = body.setdefault("reasoning", {})
+        reasoning.setdefault("summary", self.valves.SUMMARY_MODE)
+        reasoning.setdefault("effort", effort)
 
-        body.update({"model": base, "stream": True})
+        body.update({"model": base_model, "stream": True})
 
-        # ---- upstream call (async) --------------------------------
-        async with httpx.AsyncClient(timeout=600.0) as client:
+        async with httpx.AsyncClient(timeout=600) as client:
+            async with client.stream(
+                "POST",
+                f"{self.valves.BASE_URL}/responses",
+                json=body,
+                headers=headers,
+            ) as response:
+                if response.status_code != 200:
+                    error_text = await response.aread()
+                    yield f"Error: {response.status_code} {error_text.decode('utf-8')}"
+                    return
+
+                # Send <think> tag immediately
+                yield "<think>\nReasoning Started...\n"
+                think_open = True
+                current_event: str | None = None
+                summary_started = False
+
+                async for line in response.aiter_lines():
+                    if not line:
+                        continue
+                    if line.startswith("event:"):
+                        current_event = line[6:].strip()
+                        continue
+                    if not line.startswith("data:"):
+                        continue
+
+                    try:
+                        payload = json.loads(line[5:].strip())
+                    except Exception:
+                        continue
+
+                    # Handle reasoning summary
+                    if current_event and current_event.startswith(
+                        "response.reasoning_summary"
+                    ):
+                        if current_event.endswith("part.added"):
+                            if summary_started:
+                                yield "\n\n"
+                            summary_started = True
+                            continue
+                        if current_event.endswith("text.delta"):
+                            txt = self._pick_text(payload)
+                            if txt:
+                                yield txt
+                            continue
+                        continue
+
+                    # Handle main output
+                    if current_event == "response.output_text.delta":
+                        if think_open:
+                            yield "</think>\n"
+                            think_open = False
+                        token = self._pick_text(payload)
+                        if token:
+                            yield token
+
+                if think_open:
+                    yield "</think>\n"
+
+    async def _handle_normal_model(
+        self, body: dict, model_id: str, headers: dict
+    ) -> AsyncGenerator[str, None]:
+        """Handle normal models without reasoning"""
+        # Convert messages format for normal models
+        new_messages = []
+        messages = body["messages"]
+        for message in messages:
             try:
-                async with client.stream(
-                    "POST",
-                    f"{self.valves.OPENAI_API_BASE_URL}/responses",
-                    json=body,
-                    headers={
-                        "Authorization": f"Bearer {self.valves.OPENAI_API_KEY}",
-                        "Content-Type": "application/json",
-                    },
-                ) as resp:
-                    resp.raise_for_status()
-
-                    # ---- SSE transform (async) ---------------------------------------
-                    # MODIFICATION START: Send <think> tag immediately and set think_open to True
-                    yield b"data: " + self._envelope(
-                        "<think>\nReasoning Started...\n"
-                    ) + b"\n\n"
-                    think_open = True
-                    # MODIFICATION END
-
-                    current_event: str | None = None
-                    summary_started = (
-                        False  # Used to add newlines between summary parts
+                if message["role"] == "user":
+                    if isinstance(message["content"], list):
+                        content = []
+                        for i in message["content"]:
+                            if i["type"] == "text":
+                                content.append(
+                                    {"type": "input_text", "text": i["text"]}
+                                )
+                            elif i["type"] == "image_url":
+                                content.append(
+                                    {
+                                        "type": "input_image",
+                                        "image_url": i["image_url"]["url"],
+                                    }
+                                )
+                        new_messages.append({"role": "user", "content": content})
+                    else:
+                        new_messages.append(
+                            {
+                                "role": "user",
+                                "content": [
+                                    {"type": "input_text", "text": message["content"]}
+                                ],
+                            }
+                        )
+                elif message["role"] == "assistant":
+                    new_messages.append(
+                        {
+                            "role": "assistant",
+                            "content": [
+                                {"type": "output_text", "text": message["content"]}
+                            ],
+                        }
                     )
+                elif message["role"] == "system":
+                    new_messages.append(
+                        {
+                            "role": "system",
+                            "content": [
+                                {"type": "input_text", "text": message["content"]}
+                            ],
+                        }
+                    )
+            except Exception as e:
+                yield f"Error: {message} - {str(e)}"
+                return
 
-                    async for line in resp.aiter_lines():
-                        if not line:
-                            continue
-                        if line.startswith("event:"):
-                            current_event = line[6:].strip()
-                            continue
-                        if not line.startswith("data:"):
-                            continue
+        payload = {**body, "model": model_id}
+        payload.pop("messages")
+        payload["input"] = new_messages
+        payload["stream"] = True
+
+        async with httpx.AsyncClient(timeout=600) as client:
+            async with client.stream(
+                "POST",
+                f"{self.valves.BASE_URL}/responses",
+                json=payload,
+                headers=headers,
+            ) as response:
+                if response.status_code != 200:
+                    error_text = await response.aread()
+                    yield f"Error: {response.status_code} {error_text.decode('utf-8')}"
+                    return
+
+                async for line in response.aiter_lines():
+                    if line:
                         try:
-                            payload = json.loads(line[5:].strip())
+                            if line.startswith("data:"):
+                                line_data = json.loads(line[5:])
+                                yield line_data["delta"]
                         except Exception:
-                            continue
+                            pass
 
-                        if current_event and current_event.startswith(
-                            "response.reasoning_summary"
-                        ):
-                            if current_event.endswith("part.added"):
-                                # MODIFICATION START: <think> is already open.
-                                # This logic now only handles newlines between summary parts.
-                                if (
-                                    summary_started
-                                ):  # If a previous summary part was already added
-                                    yield b"data: " + self._envelope("\n\n") + b"\n\n"
-                                summary_started = True  # Mark that at least one summary part has been initiated
-                                # MODIFICATION END
-                                continue
-                            if current_event.endswith(
-                                "text.delta"
-                            ):  # and think_open is implicitly True
-                                txt = self._pick_text(payload)
-                                if txt:
-                                    yield b"data: " + self._envelope(txt) + b"\n\n"
-                                continue
-                            continue
+    async def pipe(self, body: dict, __user__: dict):
+        self.key = random.choice(self.valves.API_KEYS.split(",")).strip()
+        print(f"pipe:{__name__}")
 
-                        if current_event == "response.output_text.delta":
-                            if think_open:
-                                yield b"data: " + self._envelope("</think>\n") + b"\n\n"
-                                think_open = False
-                            token = self._pick_text(payload)
-                            if token:
-                                yield b"data: " + self._envelope(token) + b"\n\n"
+        headers = {
+            "Authorization": f"Bearer {self.key}",
+            "Content-Type": "application/json",
+        }
 
-                    if think_open:
-                        yield b"data: " + self._envelope("</think>\n") + b"\n\n"
+        model_id = body["model"][body["model"].find(".") + 1 :]
 
-            except httpx.HTTPStatusError as e:
-                error_content = ""
-                try:
-                    error_content_bytes = await e.response.aread()
-                    error_content = error_content_bytes.decode(errors="replace")
-                except Exception:
-                    error_content = str(e)
-                raise Exception(
-                    f"Upstream API Error: {e.response.status_code} - {error_content}"
-                ) from e
-            except httpx.RequestError as e:
-                raise Exception(f"Request failed: {str(e)}") from e
+        try:
+            if self._is_reasoning_model(model_id):
+                async for chunk in self._handle_reasoning_model(
+                    body, model_id, headers
+                ):
+                    yield chunk
+            elif self._is_normal_model(model_id):
+                async for chunk in self._handle_normal_model(body, model_id, headers):
+                    yield chunk
+            else:
+                yield f"Error: Model {model_id} not found in NORMAL_MODELS or REASONING_MODELS"
+                return
+        except Exception as e:
+            yield f"Error: {e}"
+            return
